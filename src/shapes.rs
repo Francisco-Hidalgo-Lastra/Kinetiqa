@@ -2,7 +2,9 @@
 //! where its label goes, and where an arrow touches its outline. Everything here works in
 //! screen space; callers pass the item's on-screen rect and the current zoom.
 
-use eframe::egui::{self, Align, Color32, FontId, Mesh, Painter, Pos2, Rect, Stroke, Vec2};
+use std::sync::Arc;
+
+use eframe::egui::{self, Align, Color32, FontId, Galley, Mesh, Painter, Pos2, Rect, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::theme;
@@ -11,6 +13,10 @@ use crate::theme;
 pub const FONT_SIZE: f32 = 15.0;
 /// Labels smaller than this on screen aren't drawn (they'd just be noise when zoomed far out).
 const MIN_FONT_SIZE: f32 = 4.0;
+/// Arrow label font size at 100% zoom (scaled with the zoom).
+pub const LINK_FONT_SIZE: f32 = 13.0;
+/// Width arrow labels wrap at, at 100% zoom.
+pub const LINK_LABEL_WIDTH: f32 = 160.0;
 /// Space between a shape's outline and its label, at 100% zoom.
 const TEXT_PADDING: f32 = 8.0;
 
@@ -325,6 +331,33 @@ pub fn paint_arrow(shapes: &mut Vec<egui::Shape>, from: Pos2, to: Pos2, width: f
     let side = dir.rot90() * head_len * 0.5;
     shapes.push(egui::Shape::line_segment([from, base + dir * 0.5], Stroke::new(width, color)));
     shapes.push(egui::Shape::convex_polygon(vec![to, base + side, base - side], color, Stroke::NONE));
+}
+
+/// A laid-out arrow label: where to paint the galley, the galley, and its padded on-screen rect.
+pub type LinkLabel = (Pos2, Arc<Galley>, Rect);
+
+/// An arrow's label laid out centered on `mid`: where to paint the galley, the galley, and its
+/// padded on-screen rect (the plate behind it and its hit area). `None` when there's no text or
+/// it would be too small to read.
+pub fn layout_link_label(painter: &Painter, text: &str, mid: Pos2, zoom: f32) -> Option<LinkLabel> {
+    let size = LINK_FONT_SIZE * zoom;
+    if text.is_empty() || size < MIN_FONT_SIZE {
+        return None;
+    }
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), FontId::proportional(size), theme::TEXT, LINK_LABEL_WIDTH * zoom);
+    job.halign = Align::Center;
+    let galley = painter.layout_job(job);
+    // `galley.rect` is in the galley's own coordinates (centered rows can start at negative x).
+    let at = mid - galley.rect.center().to_vec2();
+    let rect = galley.rect.translate(at.to_vec2()).expand2(Vec2::new(5.0, 2.0) * zoom);
+    Some((at, galley, rect))
+}
+
+/// Paint a label from `layout_link_label` on a canvas-colored plate, so the line looks broken
+/// around the text instead of crossing it.
+pub fn paint_link_label(shapes: &mut Vec<egui::Shape>, at: Pos2, galley: Arc<Galley>, rect: Rect, zoom: f32) {
+    shapes.push(egui::Shape::rect_filled(rect, 4.0 * zoom, theme::CANVAS));
+    shapes.push(egui::Shape::galley(at, galley, theme::TEXT));
 }
 
 /// Distance from `p` to the segment `a`–`b`.

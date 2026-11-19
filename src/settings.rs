@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     /// Where every board is saved to and opened from.
     pub boards_dir: PathBuf,
+    /// Keep the top toolbar visible instead of auto-hiding it.
+    pub always_show_toolbar: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { boards_dir: default_boards_dir() }
+        Self { boards_dir: default_boards_dir(), always_show_toolbar: false }
     }
 }
 

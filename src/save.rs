@@ -55,6 +55,9 @@ pub struct ShapeFile {
 pub struct LinkFile {
     pub from: usize,
     pub to: usize,
+    /// Label shown at the arrow's midpoint. Optional, so older version 2 files still load.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
 }
 
 impl BoardFile {

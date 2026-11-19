@@ -86,6 +86,8 @@ struct Link {
     id: u64,
     from: u64,
     to: u64,
+    /// Label painted at the arrow's midpoint; empty for none.
+    text: String,
 }
 
 /// What was picked in the right-click menu; applied after the menu's UI has run.
@@ -205,7 +207,8 @@ struct Board {
     selected_link: Option<u64>,
     /// Item whose connect handle is being dragged to make a new arrow.
     connecting: Option<u64>,
-    /// Shape whose label is being typed into, and whether its text field still needs focus.
+    /// Shape or arrow whose label is being typed into (ids are unique across both), and whether
+    /// its text field still needs focus.
     editing: Option<(u64, bool)>,
     /// Right-click options window: what it's for and where it opened (screen space).
     menu: Option<(Target, Pos2)>,
@@ -242,6 +245,7 @@ enum DialogAction {
     Open(PathBuf),
     PickFolder,
     ResetFolder,
+    SetAlwaysShowToolbar(bool),
 }
 
 impl Default for Board {
@@ -364,12 +368,12 @@ impl Board {
     }
 
     /// Add an arrow `from` → `to` unless it already exists (or would point at itself).
-    fn connect(&mut self, from: u64, to: u64) {
+    fn connect(&mut self, from: u64, to: u64, text: String) {
         if from == to || self.links.iter().any(|l| l.from == from && l.to == to) {
             return;
         }
         let id = self.new_id();
-        self.links.push(Link { id, from, to });
+        self.links.push(Link { id, from, to, text });
     }
 
     fn remove_link(&mut self, id: u64) {
@@ -379,6 +383,9 @@ impl Board {
         }
         if self.menu.is_some_and(|(target, _)| target == Target::Link(id)) {
             self.menu = None;
+        }
+        if self.editing.is_some_and(|(e, _)| e == id) {
+            self.editing = None;
         }
     }
 
@@ -428,7 +435,7 @@ impl Board {
         let links = self
             .links
             .iter()
-            .filter_map(|l| Some(save::LinkFile { from: *index.get(&l.from)?, to: *index.get(&l.to)? }))
+            .filter_map(|l| Some(save::LinkFile { from: *index.get(&l.from)?, to: *index.get(&l.to)?, text: l.text.clone() }))
             .collect();
         match save::write(&file, save::BoardFile::new(self.pan.into(), self.zoom, items, links)) {
             Ok(()) => self.set_name(ctx, name),
@@ -468,7 +475,7 @@ impl Board {
         }
         for link in board.links {
             if let (Some(&from), Some(&to)) = (ids.get(link.from), ids.get(link.to)) {
-                self.connect(from, to);
+                self.connect(from, to, link.text);
             }
         }
         self.set_name(ctx, file.file_stem().unwrap_or_default().to_string_lossy().into_owned());
@@ -544,7 +551,8 @@ impl Board {
         let pointer_y = ctx.input(|i| i.pointer.hover_pos()).map(|p| p.y - screen.top());
         // Once shown, it stays while the pointer is anywhere over it.
         let reveal = if self.toolbar_visible { self.toolbar_height } else { TOOLBAR_REVEAL };
-        let show = pointer_y.is_some_and(|y| y <= reveal)
+        let show = self.settings.always_show_toolbar
+            || pointer_y.is_some_and(|y| y <= reveal)
             || egui::Popup::is_any_open(ctx)
             || self.dialog.is_some()
             || !self.errors.is_empty()
@@ -702,6 +710,7 @@ impl Board {
         let Some(dialog) = &mut self.dialog else { return };
         let dir = self.settings.boards_dir.clone();
         let current = self.name.clone();
+        let mut always_show_toolbar = self.settings.always_show_toolbar;
         let mut action = None;
         let mut close = false;
         let modal = egui::Modal::new(egui::Id::unique("dialog"))
@@ -802,6 +811,14 @@ impl Board {
                             }
                         });
                         ui.add_space(14.0);
+                        ui.label(RichText::new("Toolbar").strong().color(theme::TEXT));
+                        if ui.checkbox(&mut always_show_toolbar, "Always show the top bar")
+                            .on_hover_text("Off: the toolbar slides in when the pointer goes to the top edge")
+                            .changed()
+                        {
+                            action = Some(DialogAction::SetAlwaysShowToolbar(always_show_toolbar));
+                        }
+                        ui.add_space(14.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Close").clicked() {
                                 close = true;
@@ -828,6 +845,12 @@ impl Board {
                 }
             }
             Some(DialogAction::ResetFolder) => self.set_boards_dir(settings::default_boards_dir()),
+            Some(DialogAction::SetAlwaysShowToolbar(on)) => {
+                self.settings.always_show_toolbar = on;
+                if let Err(e) = self.settings.save() {
+                    self.errors.push(format!("Couldn't save settings: {e}"));
+                }
+            }
             None => {}
         }
     }
@@ -1097,23 +1120,30 @@ impl Board {
             .iter()
             .map(|i| (i.id, (Rect::from_min_size(to_screen(i.pos), i.size * zoom), i.shape_kind())))
             .collect();
-        let segments: Vec<(u64, Pos2, Pos2)> = self
+        // Each drawable arrow's ends and its laid-out label (none while it's being edited: the
+        // text field shows it instead).
+        let editing = self.editing.map(|(id, _)| id);
+        let segments: Vec<(u64, Pos2, Pos2, Option<shapes::LinkLabel>)> = self
             .links
             .iter()
             .filter_map(|l| {
                 let (&(a, ka), &(b, kb)) = (rects.get(&l.from)?, rects.get(&l.to)?);
-                Some((l.id, shapes::boundary_point(ka, a, b.center()), shapes::boundary_point(kb, b, a.center())))
+                let (a, b) = (shapes::boundary_point(ka, a, b.center()), shapes::boundary_point(kb, b, a.center()));
+                let label = if editing == Some(l.id) { None } else { shapes::layout_link_label(&painter, &l.text, a.lerp(b, 0.5), zoom) };
+                Some((l.id, a, b, label))
             })
             .collect();
-        // Closest arrow within reach of `p`. Only asked for points on the bare background, so
-        // items always win over the arrows beneath them.
+        // Arrow whose label is under `p`, else the closest arrow within reach. Only asked for
+        // points on the bare background, so items always win over the arrows beneath them.
         let link_at = |p: Pos2| {
-            segments
-                .iter()
-                .map(|&(id, a, b)| (id, shapes::distance_to_segment(p, a, b)))
-                .filter(|&(_, d)| d <= LINK_GRAB)
-                .min_by(|x, y| x.1.total_cmp(&y.1))
-                .map(|(id, _)| id)
+            segments.iter().rev().find(|s| s.3.as_ref().is_some_and(|l| l.2.contains(p))).map(|s| s.0).or_else(|| {
+                segments
+                    .iter()
+                    .map(|&(id, a, b, _)| (id, shapes::distance_to_segment(p, a, b)))
+                    .filter(|&(_, d)| d <= LINK_GRAB)
+                    .min_by(|x, y| x.1.total_cmp(&y.1))
+                    .map(|(id, _)| id)
+            })
         };
         let hovered_link = if background.dragged() { None } else { background.hover_pos().and_then(link_at) };
         if hovered_link.is_some() {
@@ -1132,8 +1162,18 @@ impl Board {
             self.menu = Some((Target::Link(id), at));
             menu_opened = true;
         }
+        // Double-clicking an arrow (or its label) edits its label.
+        if background.double_clicked()
+            && let Some(at) = background.interact_pointer_pos()
+            && let Some(id) = link_at(at)
+        {
+            self.selected.clear();
+            self.selected_link = Some(id);
+            self.editing = Some((id, true));
+            self.menu = None;
+        }
         let mut arrows = Vec::new();
-        for &(id, a, b) in &segments {
+        for (id, a, b, label) in segments {
             let (color, width) = if self.selected_link == Some(id) {
                 (theme::ACCENT, 2.5)
             } else if hovered_link == Some(id) {
@@ -1142,6 +1182,44 @@ impl Board {
                 (theme::TEXT_DIM, 1.75)
             };
             shapes::paint_arrow(&mut arrows, a, b, (width * zoom).clamp(1.0, width * 2.0), color, zoom);
+            if let Some((at, galley, rect)) = label {
+                shapes::paint_link_label(&mut arrows, at, galley, rect, zoom);
+            }
+            // Label editor at the midpoint, on a plate that hides the line under the text.
+            if editing == Some(id)
+                && let Some(link) = self.links.iter_mut().find(|l| l.id == id)
+            {
+                let font = egui::FontId::proportional(shapes::LINK_FONT_SIZE * zoom);
+                let lines = link.text.lines().count().max(1) as f32;
+                let size = Vec2::new(shapes::LINK_LABEL_WIDTH * zoom, ui.fonts_mut(|f| f.row_height(&font)) * lines);
+                let area = Rect::from_center_size(a.lerp(b, 0.5), size);
+                arrows.push(egui::Shape::rect_filled(area.expand2(Vec2::new(5.0, 2.0) * zoom), 4.0 * zoom, theme::CANVAS));
+                let edit = egui::TextEdit::multiline(&mut link.text)
+                    .id(egui::Id::unique(("link-text", id)))
+                    .frame(egui::Frame::NONE)
+                    .margin(Margin::ZERO)
+                    .align(Align2::CENTER_CENTER)
+                    .font(font)
+                    .text_color(theme::TEXT)
+                    .desired_width(area.width())
+                    .min_size(area.size());
+                let edit = ui.put(area, edit);
+                if let Some((_, focus)) = &mut self.editing
+                    && std::mem::take(focus)
+                {
+                    edit.request_focus();
+                } else if !edit.has_focus() {
+                    // Clicked elsewhere or pressed Escape.
+                    self.editing = None;
+                }
+            }
+        }
+        // An arrow being edited can lose an end (its item removed); stop editing it then.
+        if let Some(id) = editing
+            && let Some(link) = self.links.iter().find(|l| l.id == id)
+            && !(rects.contains_key(&link.from) && rects.contains_key(&link.to))
+        {
+            self.editing = None;
         }
         painter.set(links_slot, egui::Shape::Vec(arrows));
 
@@ -1166,7 +1244,7 @@ impl Board {
             let (released, down) = ui.input(|i| (i.pointer.primary_released(), i.pointer.primary_down()));
             if released || !down {
                 if released && let Some(to) = target {
-                    self.connect(from, to);
+                    self.connect(from, to, String::new());
                 }
                 self.connecting = None;
             }
@@ -1215,8 +1293,13 @@ impl Board {
                             });
                             ui.separator();
                         }
-                        if matches!(target, Target::Link(_)) && menu_item(ui, RichText::new("Reverse direction").color(theme::TEXT)).clicked() {
-                            action = Some(MenuAction::Reverse);
+                        if matches!(target, Target::Link(_)) {
+                            if menu_item(ui, RichText::new("Edit label").color(theme::TEXT)).on_hover_text("Or double-click the arrow · Enter").clicked() {
+                                action = Some(MenuAction::EditText);
+                            }
+                            if menu_item(ui, RichText::new("Reverse direction").color(theme::TEXT)).clicked() {
+                                action = Some(MenuAction::Reverse);
+                            }
                         }
                         if menu_item(ui, RichText::new("🗑  Remove").color(theme::DANGER)).clicked() {
                             action = Some(MenuAction::Remove);
@@ -1237,6 +1320,11 @@ impl Board {
                 (Some(MenuAction::Remove), Target::Link(id)) => self.remove_link(id),
                 (Some(MenuAction::EditText), Target::Item(id)) => {
                     self.select(id);
+                    self.editing = Some((id, true));
+                }
+                (Some(MenuAction::EditText), Target::Link(id)) => {
+                    self.selected.clear();
+                    self.selected_link = Some(id);
                     self.editing = Some((id, true));
                 }
                 (Some(MenuAction::Color(color)), Target::Item(id)) => {
@@ -1312,6 +1400,13 @@ impl Board {
             && item.shape_kind().is_some()
         {
             self.editing = Some((item.id, true));
+        }
+        // ...or into the selected arrow's label.
+        if !wants_keyboard && ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::F2))
+            && self.selected.is_empty()
+            && let Some(id) = self.selected_link
+        {
+            self.editing = Some((id, true));
         }
         // Delete / Backspace removes the selected items or arrow.
         if !wants_keyboard && ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
