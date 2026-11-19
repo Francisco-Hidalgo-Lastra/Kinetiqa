@@ -1,0 +1,17 @@
+[package]
+name = "kinetiqa"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.37"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+rfd = "0.18"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+# Optimize dependencies even in dev builds: unoptimized egui/image code is far too slow for
+# per-frame work (converting one 1280×720 video frame took ~77 ms, capping video at ~13 fps).
+# Our own crate stays at opt-level 0, so incremental rebuilds remain fast.
+[profile.dev.package."*"]
+opt-level = 3
